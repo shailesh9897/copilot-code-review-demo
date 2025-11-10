@@ -1,79 +1,76 @@
-name: AI Code Review
-on:
-  pull_request:
-    types: [opened, synchronize, reopened]
-
-jobs:
-  review:
-    runs-on: ubuntu-latest
-    permissions:
-      pull-requests: write
-      contents: read
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # allow comparing any two SHAs
-
-      - name: Install Python deps
-        run: |
-          python3 -m pip install --upgrade pip
-          pip install requests
-
-      - name: Generate and post AI review
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          set -e
-          echo "Base: ${BASE_SHA}"
-          echo "Head: ${HEAD_SHA}"
-          git fetch --no-tags --prune --depth=1 origin "${BASE_SHA}" "${HEAD_SHA}"
-          # unified=0 keeps the comment concise; bump to 3 if you want more context
-          git diff --unified=0 "${BASE_SHA}" "${HEAD_SHA}" > diff.txt || true
-          echo "Diff bytes: $(wc -c < diff.txt)"
-
-          python3 - <<'PY'
-          import os, json, requests, sys
-
-          diff_path = "diff.txt"
-          if not os.path.exists(diff_path) or os.path.getsize(diff_path) == 0:
-              msg = "🤖 **AI Code Review Bot:** No diff content detected for this PR."
-              url = f"https://api.github.com/repos/{os.environ['REPO']}/issues/{os.environ['PR_NUMBER']}/comments"
-              headers = {"Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
-                         "Accept": "application/vnd.github+json"}
-              requests.post(url, headers=headers, json={"body": msg})
-              sys.exit(0)
-
-          diff = open(diff_path, encoding="utf-8", errors="ignore").read()[:60000]
-          prompt = f"""You are a senior Java/Spring reviewer. Review this unified diff and list issues about:
-          - Null-safety
-          - SQL/resource handling (try-with-resources, PreparedStatement)
-          - Logging/PII masking
-          - Performance (boxing/loops)
-          - General best practices
-          Use concise bullet points.
-          Diff:
-          {diff}
-          """
-
-          body = {"model": "gpt-4o-mini", "messages": [{"role":"user","content":prompt}], "temperature": 0.2}
-          r = requests.post(
-              "https://api.openai.com/v1/chat/completions",
-              headers={"Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}",
-                       "Content-Type": "application/json"},
-              data=json.dumps(body), timeout=90
-          )
-          r.raise_for_status()
-          review = r.json()["choices"][0]["message"]["content"]
-
-          url = f"https://api.github.com/repos/{os.environ['REPO']}/issues/{os.environ['PR_NUMBER']}/comments"
-          headers = {"Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
-                     "Accept": "application/vnd.github+json"}
-          requests.post(url, headers=headers, json={"body": f"🤖 **AI Code Review Bot**\n\n{review}"})
-          PY
+- name: Generate and post AI review
+  env:
+    OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    REPO: ${{ github.repository }}
+    PR_NUMBER: ${{ github.event.pull_request.number }}
+    BASE_SHA: ${{ github.event.pull_request.base.sha }}
+    HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+  run: |
+    set -e
+    echo "Base: ${BASE_SHA}"
+    echo "Head: ${HEAD_SHA}"
+    git fetch --no-tags --prune --depth=1 origin "${BASE_SHA}" "${HEAD_SHA}"
+    git diff --unified=0 "${BASE_SHA}" "${HEAD_SHA}" > diff.txt || true
+    echo "Diff bytes: $(wc -c < diff.txt)"
+    
+    python3 - <<'PY'
+    import os, json, requests, sys, time
+    
+    # --- DEBUG: confirm the key is present (no value printed) ---
+    k = os.environ.get("OPENAI_API_KEY", "")
+    print("Has OPENAI_API_KEY?:", bool(k), "length:", len(k))  # DEBUG
+    if not k:
+        print("OPENAI_API_KEY is empty. Re-check repo secret name/value.")
+        sys.exit(1)
+    # -------------------------------------------------------------
+    
+    diff_path = "diff.txt"
+    if not os.path.exists(diff_path) or os.path.getsize(diff_path) == 0:
+        msg = "🤖 **AI Code Review Bot:** No diff content detected for this PR."
+        url = f"https://api.github.com/repos/{os.environ['REPO']}/issues/{os.environ['PR_NUMBER']}/comments"
+        headers = {"Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
+                   "Accept": "application/vnd.github+json"}
+        requests.post(url, headers=headers, json={"body": msg})
+        sys.exit(0)
+    
+    diff = open(diff_path, encoding="utf-8", errors="ignore").read()[:60000]
+    prompt = f"""You are a senior Java/Spring reviewer. Review this unified diff and list issues about:
+    - Null-safety
+    - SQL/resource handling (try-with-resources, PreparedStatement)
+    - Logging/PII masking
+    - Performance (boxing/loops)
+    - General best practices
+    Use concise bullet points.
+    Diff:
+    {diff}
+    """
+    
+    body = {"model": "gpt-4o-mini", "messages": [{"role":"user","content":prompt}], "temperature": 0.2}
+    
+    # Resilient call with retries (handles 429s)
+    def call_openai():
+        for attempt in range(5):
+            r = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}",
+                         "Content-Type": "application/json"},
+                data=json.dumps(body), timeout=90
+            )
+            if r.status_code in (429, 500, 502, 503, 504):
+                wait = 2 ** attempt
+                print(f"OpenAI status {r.status_code}; retrying in {wait}s...")
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            return r
+        r.raise_for_status()
+    
+    r = call_openai()
+    review = r.json()["choices"][0]["message"]["content"]
+    
+    url = f"https://api.github.com/repos/{os.environ['REPO']}/issues/{os.environ['PR_NUMBER']}/comments"
+    headers = {"Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
+               "Accept": "application/vnd.github+json"}
+    requests.post(url, headers=headers, json={"body": f"🤖 **AI Code Review Bot**\n\n{review}"})
+    PY
