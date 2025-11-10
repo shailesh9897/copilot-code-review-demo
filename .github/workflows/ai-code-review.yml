@@ -1,96 +1,140 @@
-name: AI Code Review
+# .github/workflows/ai-code-review.yml
+name: AI Code Review                       # Workflow name shown in Actions tab
+
 on:
-  pull_request:
-    types: [opened, synchronize, reopened]
+  pull_request:                            # Run for PR events (from same repo)
+    types: [opened, synchronize, reopened] # opened = new PR, synchronize = new push, reopened = re-open PR
 
 jobs:
-  review:
-    runs-on: ubuntu-latest
+  review:                                   # Single job called "review"
+    runs-on: ubuntu-latest                  # GitHub-hosted Ubuntu runner
+
+    # Minimal permissions to read code and write PR comments
     permissions:
-      pull-requests: write
-      contents: read
+      pull-requests: write                  # Needed to post PR comments
+      contents: read                        # Needed to read repo contents
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0                    # Full history so we can diff any two SHAs
 
       - name: Install Python deps
         run: |
-          python3 -V
-          python3 -m pip install --upgrade pip
-          pip install requests
+          python3 -m pip install --upgrade pip  # Make sure pip is recent
+          pip install requests                  # requests only (we call OpenAI REST directly)
 
       - name: Generate and post AI review
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          # Secrets and PR context we’ll use in the script
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}         # Your OpenAI key (repo secret)
+          GITHUB_TOKEN:    ${{ secrets.GITHUB_TOKEN }}          # Auto-provided token to call GitHub API
+          REPO:            ${{ github.repository }}             # e.g., owner/repo
+          PR_NUMBER:       ${{ github.event.pull_request.number }}
+          BASE_SHA:        ${{ github.event.pull_request.base.sha }} # Base commit of PR
+          HEAD_SHA:        ${{ github.event.pull_request.head.sha }} # Head commit of PR branch
         run: |
           set -e
-          echo "Base branch: ${BASE_REF}"
-          git fetch origin "${BASE_REF}" --depth=1
-          # Use a 0-context diff so comments are concise; change to --unified=3 if you want more context
-          git diff --unified=0 origin/"${BASE_REF}"...HEAD > diff.txt || true
-          echo "Diff size: $(wc -c < diff.txt) bytes"
+          echo "Base: ${BASE_SHA}"
+          echo "Head: ${HEAD_SHA}"
 
+          # Fetch exactly the two PR SHAs so shallow clones don't break diffs
+          git fetch --no-tags --prune --depth=1 origin "${BASE_SHA}" "${HEAD_SHA}"
+
+          # Produce a concise unified diff between base and head (0 lines of context)
+          git diff --unified=0 "${BASE_SHA}" "${HEAD_SHA}" > diff.txt || true
+          echo "Diff bytes: $(wc -c < diff.txt)"
+
+          # The review logic (Python) – reads diff, calls OpenAI, posts a PR comment
           python3 - <<'PY'
-          import os, json, requests
+          import os, json, requests, sys, time, pathlib
 
-          # Read diff and limit to ~60k chars to avoid model limits on big PRs
-          diff = open("diff.txt", "r", encoding="utf-8", errors="ignore").read()[:60000]
-          if not diff.strip():
-              msg = "🤖 **AI Code Review Bot:** No diff content detected for this PR."
-              print(msg)
-              # Still post a comment so users see the bot ran
-              repo = os.environ["GITHUB_REPOSITORY"]
-              pr = os.environ["PR_NUMBER"]
+          # --- Helpers ---------------------------------------------------------
+          repo = os.environ["REPO"]
+          pr   = os.environ["PR_NUMBER"]
+          gh_headers = {
+              "Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
+              "Accept": "application/vnd.github+json"
+          }
+
+          def comment(body: str):
+              """Post a regular issue comment to the PR."""
               url = f"https://api.github.com/repos/{repo}/issues/{pr}/comments"
-              headers = {"Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
-                         "Accept": "application/vnd.github+json"}
-              requests.post(url, headers=headers, json={"body": msg})
-              raise SystemExit(0)
+              r = requests.post(url, headers=gh_headers, json={"body": body})
+              print("Comment status:", r.status_code, r.text[:200])
 
-          prompt = f"""
-          You are a senior Java/Spring reviewer. Review this unified git diff.
-          Focus on:
+          # --- Pre-checks ------------------------------------------------------
+          # 1) Make sure the OpenAI key is present (masking handled by GitHub)
+          has_key = bool(os.environ.get("OPENAI_API_KEY", ""))
+          print("Has OPENAI_API_KEY?:", has_key)
+          if not has_key:
+              comment("❗ **AI Code Review Bot:** Missing API key. Add repository secret `OPENAI_API_KEY`.")
+              sys.exit(0)  # Exit gracefully (green) for demo
+
+          # 2) Make sure there is a diff
+          diff_path = pathlib.Path("diff.txt")
+          if not diff_path.exists() or diff_path.stat().st_size == 0:
+              comment("🤖 **AI Code Review Bot:** No diff content detected for this PR.")
+              sys.exit(0)  # No changes to review
+
+          # Read and truncate diff to keep request size modest
+          diff = diff_path.read_text(encoding="utf-8", errors="ignore")[:60000]
+
+          # Review instructions tuned for Java/Spring issues
+          prompt = f"""You are a senior Java/Spring reviewer. Review this unified git diff and provide concise bullet points.
+          Prioritize:
           - Null-safety (Optional.get, potential NPEs)
-          - SQL & resource handling (concatenated SQL, try-with-resources, PreparedStatement)
-          - Logging/PII (mask sensitive IDs)
-          - Performance (unnecessary boxing, inefficient loops)
-          - General best practices
-
-          Return a concise bullet list. If no issues, say 'No issues found.'
+          - SQL & resource handling (PreparedStatement, try-with-resources)
+          - Logging/PII masking
+          - Performance (boxing, inefficient loops)
+          - General Spring/Java best practices
+          If no issues, say 'No issues found.'
           Diff:
           {diff}
           """
 
-          # Call OpenAI Chat Completions API via requests to avoid SDK version pitfalls
+          # OpenAI request payload — use a light model to reduce rate limits/costs
           body = {
-              "model": "gpt-4o-mini",  # or "gpt-4o" if you have access
-              "messages": [{"role": "user", "content": prompt}],
-              "temperature": 0.2
+            "model": "gpt-4o-mini",
+            "messages": [{"role":"user","content":prompt}],
+            "temperature": 0.2
           }
-          r = requests.post(
-              "https://api.openai.com/v1/chat/completions",
-              headers={
-                  "Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}",
-                  "Content-Type": "application/json"
-              },
-              data=json.dumps(body),
-              timeout=90
-          )
-          r.raise_for_status()
+
+          # Call OpenAI with retries to survive 429/5xx
+          def call_openai_with_retries():
+              last = None
+              for attempt in range(5):  # exponential backoff
+                  r = requests.post(
+                      "https://api.openai.com/v1/chat/completions",
+                      headers={
+                          "Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}",
+                          "Content-Type": "application/json"
+                      },
+                      data=json.dumps(body),
+                      timeout=90
+                  )
+                  if r.status_code in (429, 500, 502, 503, 504):
+                      wait = [2, 4, 8, 16, 30][attempt]
+                      print(f"OpenAI {r.status_code}; retrying in {wait}s...")
+                      time.sleep(wait)
+                      last = r
+                      continue
+                  r.raise_for_status()
+                  return r
+              return last
+
+          r = call_openai_with_retries()
+
+          # If still rate-limited or erroring, don't fail the workflow (demo-friendly)
+          if not r or r.status_code != 200:
+              status = r.status_code if r else "unknown"
+              comment(f"⚠️ **AI Code Review Bot:** Rate limited or temporary error (HTTP {status}). "
+                      f"Please re-run the job or try again later.")
+              sys.exit(0)
+
           review = r.json()["choices"][0]["message"]["content"]
 
-          # Post the review as a PR comment
-          repo = os.environ["GITHUB_REPOSITORY"]
-          pr = os.environ["PR_NUMBER"]
-          url = f"https://api.github.com/repos/{repo}/issues/{pr}/comments"
-          headers = {"Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
-                     "Accept": "application/vnd.github+json"}
-          payload = {"body": f"🤖 **AI Code Review Bot**\n\n{review}"}
-          pr_resp = requests.post(url, headers=headers, json=payload)
-          print("Posted comment status:", pr_resp.status_code, pr_resp.text[:200])
+          # Post the AI review as a PR comment
+          comment(f"🤖 **AI Code Review Bot**\n\n{review}")
           PY
