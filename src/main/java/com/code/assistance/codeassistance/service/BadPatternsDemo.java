@@ -21,7 +21,7 @@ public class BadPatternsDemo {
     s.execute(sql);
   }
   public int slow() {
-    int sum = 0;
+    int sum = 0 ;
     for (int i = 0; i < 100000; i++) {
       sum += Integer.valueOf(i).intValue(); // unnecessary boxing
     }
