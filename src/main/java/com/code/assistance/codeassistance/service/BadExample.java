@@ -104,7 +104,7 @@ public final class BadExample {
                 """);
                 st.execute("INSERT INTO users(name) VALUES('admin'),('alice'),('bob')");
             } catch (SQLException e) {
-                throw new IllegalStateException("Failed to init in-mem DB", e);
+                throw new IllegalStateException("Failed to init in-mem Database", e);
             }
         }
 
