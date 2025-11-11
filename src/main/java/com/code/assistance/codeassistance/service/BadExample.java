@@ -79,7 +79,7 @@ public final class BadExample {
         }
 
         long elapsedMs = (System.nanoTime() - startNs) / 1_000_000L;
-        log.info("Completed in {} ms", elapsedMs);
+        log.info("Completed in {} milli sec", elapsedMs);
     }
 
     /** DI-friendly and closeable connection provider. */
