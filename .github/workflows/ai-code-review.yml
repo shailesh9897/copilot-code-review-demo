@@ -95,15 +95,16 @@ jobs:
           if len(diff) > MAX_CHARS:
               diff = diff[:MAX_CHARS//2] + "\n\n[...snip...]\n\n" + diff[-MAX_CHARS//2:]
 
-          prompt = f"""You are a senior Java/Spring reviewer. Review this unified git diff and return concise bullets.
+          prompt = f"""You are a senior Java/Spring reviewer. Review this unified git diff and return concise bullet points.
           Focus:
           - Null-safety/NPEs
           - SQL & resource handling (PreparedStatement, try-with-resources)
           - Logging & PII masking
           - Performance (boxing, streams, loops)
           - Spring/Java best practices
-          If 50% of the things are match then respond exactly: No issues found.
-          If no issues, respond exactly: No issues found.
+          Rules:
+          - If around 50% of best practices are followed, respond exactly: No issues found.
+          - If all checks pass (no issues), respond exactly: No issues found.
           Diff:
           {diff}
           """
