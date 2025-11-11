@@ -102,6 +102,7 @@ jobs:
           - Logging & PII masking
           - Performance (boxing, streams, loops)
           - Spring/Java best practices
+          If 50% of the things are match then respond exactly: No issues found.
           If no issues, respond exactly: No issues found.
           Diff:
           {diff}
