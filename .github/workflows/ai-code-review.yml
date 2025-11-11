@@ -1,76 +1,75 @@
-name: AI Code Review  # Shown in Actions tab
+name: AI Code Review
 
 on:
-  pull_request:                      # Run on PRs
+  pull_request:
     types: [opened, synchronize, reopened]
 
 jobs:
   review:
     runs-on: ubuntu-latest
-
-    # Minimal perms to read code and write PR comments
     permissions:
       pull-requests: write
       contents: read
 
-    # === Toggle here if you want OpenAI instead of Ollama ===
-    # USE_OLLAMA: 'true' -> use local model via Ollama on the runner
-    # USE_OLLAMA: 'false' -> use OpenAI (needs OPENAI_API_KEY secret)
     env:
-      USE_OLLAMA: 'true'
-      OLLAMA_MODEL: 'llama3.1'                 # change to mistral, qwen2.5, etc.
-      OPENAI_MODEL: 'gpt-4o-mini'              # used only when USE_OLLAMA!='true'
+      # Fast, lightweight model for quick reviews (≈7B, q4 quant)
+      OLLAMA_MODEL: 'mistral:7b-instruct-q4_K_M'
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0                       # full history so we can diff any two SHAs
+          fetch-depth: 0
 
       - name: Install Python deps
         run: |
           python3 -m pip install --upgrade pip
           pip install requests
 
-      # --- Only runs when using Ollama ---
+      - name: Restore Ollama model cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ollama
+          key: ollama-${{ env.OLLAMA_MODEL }}
+
       - name: Install & start Ollama
-        if: env.USE_OLLAMA == 'true'
         run: |
           set -e
           curl -fsSL https://ollama.com/install.sh | sh
           nohup ollama serve > /tmp/ollama.log 2>&1 &
-          # Wait for API to come up
-          for i in {1..30}; do
-            curl -s http://127.0.0.1:11434/api/tags >/dev/null && break
+
+          echo "Waiting for Ollama API..."
+          for i in {1..120}; do
+            if curl -sf http://127.0.0.1:11434/api/tags >/dev/null; then
+              echo "Ollama is up"; break
+            fi
             sleep 1
           done
+
           echo "Pulling model: ${OLLAMA_MODEL}"
-          ollama pull "${OLLAMA_MODEL}"
+          for i in {1..5}; do
+            if ollama pull "${OLLAMA_MODEL}"; then break; fi
+            echo "Retry pull ($i/5)..."; sleep 10
+          done
+
+          echo "Verifying model..."
+          ollama show "${OLLAMA_MODEL}"
+
+          echo "Warming model..."
+          ollama run "${OLLAMA_MODEL}" "OK." >/dev/null || true
 
       - name: Generate and post AI review
         env:
-          # GitHub context
-          GITHUB_TOKEN:    ${{ secrets.GITHUB_TOKEN }}
-          REPO:            ${{ github.repository }}
-          PR_NUMBER:       ${{ github.event.pull_request.number }}
-          BASE_SHA:        ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA:        ${{ github.event.pull_request.head.sha }}
-
-          # Model selection
-          USE_OLLAMA:      ${{ env.USE_OLLAMA }}
-          OLLAMA_MODEL:    ${{ env.OLLAMA_MODEL }}
-          OPENAI_MODEL:    ${{ env.OPENAI_MODEL }}
-
-          # Optional OpenAI secret (used only if USE_OLLAMA!='true')
-          OPENAI_API_KEY:  ${{ secrets.OPENAI_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO:         ${{ github.repository }}
+          PR_NUMBER:    ${{ github.event.pull_request.number }}
+          BASE_SHA:     ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA:     ${{ github.event.pull_request.head.sha }}
+          OLLAMA_MODEL: ${{ env.OLLAMA_MODEL }}
         run: |
           set -e
-          echo "Base: ${BASE_SHA}"
-          echo "Head: ${HEAD_SHA}"
           git fetch --no-tags --prune --depth=1 origin "${BASE_SHA}" "${HEAD_SHA}"
           git diff --unified=0 "${BASE_SHA}" "${HEAD_SHA}" > diff.txt || true
-          echo "Diff bytes: $(wc -c < diff.txt)"
-
           python3 - <<'PY'
           import os, json, requests, sys, pathlib, time
 
@@ -80,89 +79,55 @@ jobs:
               "Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
               "Accept": "application/vnd.github+json"
           }
+
           def comment(body: str):
               url = f"https://api.github.com/repos/{repo}/issues/{pr}/comments"
               r = requests.post(url, headers=gh_headers, json={"body": body})
               print("Comment status:", r.status_code, r.text[:200])
 
-          # Ensure we actually have something to review
           diff_path = pathlib.Path("diff.txt")
           if not diff_path.exists() or diff_path.stat().st_size == 0:
               comment("🤖 **AI Code Review Bot:** No diff content detected for this PR.")
               sys.exit(0)
 
-          diff = diff_path.read_text(encoding="utf-8", errors="ignore")[:60000]
+          diff = diff_path.read_text(encoding="utf-8", errors="ignore")
+          MAX_CHARS = 20000  # keep it small for speed on 7B models
+          if len(diff) > MAX_CHARS:
+              diff = diff[:MAX_CHARS//2] + "\n\n[...snip...]\n\n" + diff[-MAX_CHARS//2:]
 
-          # Review prompt (Java/Spring focused)
-          prompt = f"""You are a senior Java/Spring reviewer. Review this unified git diff and provide concise bullet points.
-          Prioritize:
-          - Null-safety (Optional.get, potential NPEs)
+          prompt = f"""You are a senior Java/Spring reviewer. Review this unified git diff and return concise bullets.
+          Focus:
+          - Null-safety/NPEs
           - SQL & resource handling (PreparedStatement, try-with-resources)
-          - Logging/PII masking
-          - Performance (boxing, inefficient loops)
-          - General Spring/Java best practices
-          If no issues, say 'No issues found.'
+          - Logging & PII masking
+          - Performance (boxing, streams, loops)
+          - Spring/Java best practices
+          If no issues, respond exactly: No issues found.
           Diff:
           {diff}
           """
 
-          use_ollama = os.environ.get("USE_OLLAMA","").lower() == "true"
-          review_text = None
+          body = {"model": os.environ.get("OLLAMA_MODEL","mistral:7b-instruct-q4_K_M"),
+                  "messages": [{"role":"user","content": prompt}],
+                  "stream": False}
 
-          if use_ollama:
-              # -------- Ollama local inference --------
-              model = os.environ.get("OLLAMA_MODEL","llama3.1")
-              body = {
-                "model": model,
-                "messages": [{"role":"user","content": prompt}],
-                "stream": False
-              }
+          last_err = None
+          for i in range(6):
               try:
-                  r = requests.post("http://127.0.0.1:11434/api/chat",
-                                    data=json.dumps(body),
-                                    headers={"Content-Type":"application/json"},
-                                    timeout=180)
+                  r = requests.post(
+                      "http://127.0.0.1:11434/api/chat",
+                      headers={"Content-Type":"application/json"},
+                      data=json.dumps(body),
+                      timeout=480  # generous but smaller than before
+                  )
+                  if r.status_code >= 500:
+                      last_err = f"HTTP {r.status_code}"; time.sleep(8*(i+1)); continue
                   r.raise_for_status()
-                  review_text = r.json().get("message",{}).get("content","").strip()
+                  review = (r.json().get("message") or {}).get("content","").strip() or "No issues found."
+                  comment(f"🤖 **AI Code Review Bot**\n\n{review}")
+                  sys.exit(0)
               except Exception as e:
-                  review_text = f"⚠️ Ollama error: {e}"
-          else:
-              # -------- OpenAI fallback --------
-              key = os.environ.get("OPENAI_API_KEY","")
-              if not key:
-                  comment("❗ **AI Code Review Bot:** Missing `OPENAI_API_KEY` and USE_OLLAMA!=true.")
-                  sys.exit(0)
-              body = {
-                "model": os.environ.get("OPENAI_MODEL","gpt-4o-mini"),
-                "messages": [{"role":"user","content": prompt}],
-                "temperature": 0.2
-              }
-              # Simple retry loop for transient errors
-              last = None
-              for attempt in range(5):
-                  try:
-                      r = requests.post(
-                          "https://api.openai.com/v1/chat/completions",
-                          headers={"Authorization": f"Bearer {key}",
-                                   "Content-Type":"application/json"},
-                          data=json.dumps(body),
-                          timeout=90
-                      )
-                      if r.status_code in (429,500,502,503,504):
-                          time.sleep([2,4,8,16,30][attempt])
-                          last = r
-                          continue
-                      r.raise_for_status()
-                      review_text = r.json()["choices"][0]["message"]["content"].strip()
-                      break
-                  except Exception as e:
-                      last = e
-              if review_text is None:
-                  comment(f"⚠️ **AI Code Review Bot:** OpenAI call failed. {last}")
-                  sys.exit(0)
+                  last_err = str(e); time.sleep(8*(i+1))
 
-          if not review_text:
-              review_text = "No issues found."
-
-          comment(f"🤖 **AI Code Review Bot**\n\n{review_text}")
+          comment(f"⚠️ Ollama error after retries: {last_err}")
           PY
