@@ -8,7 +8,7 @@ import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 
-/** Minimal example with sane defaults and safe patterns. */
+/** Minimal example with safe patterns + closeable DB provider. */
 public final class BadExample {
 
     private static final Logger log = LoggerFactory.getLogger(BadExample.class);
@@ -36,59 +36,60 @@ public final class BadExample {
 
             try (ResultSet rs = ps.executeQuery()) {
                 List<String> result = new ArrayList<>();
-                while (rs.next()) {                 // simple tight loop (efficient)
+                while (rs.next()) { // efficient tight loop
                     result.add(rs.getString(1));
                 }
-                // Return empty list if none; never null
-                return result;
+                return result; // empty if none; never null
             }
         } catch (SQLException e) {
-            // Mask PII: log only a hash/length, never raw user input or secrets
+            // Mask PII: only hash/length
             log.error("DB error while fetching user by name (masked) nameHash={}, len={}",
                       safeName.hashCode(), safeName.length(), e);
             return Collections.emptyList();
         }
     }
 
-    /** Small demo runner (no hardcoded secrets; uses primitives; no sleeps). */
+    /** Demo runner: uses primitives, no sleeps, no secrets logged. */
     public static void main(String[] args) {
-        long startNs = System.nanoTime(); // primitive long (no boxing)
+        long startNs = System.nanoTime(); // primitive (no boxing)
 
         String user = (args.length > 0) ? args[0] : "admin";
-        if ("admin".equals(user)) { // correct String comparison
+        if ("admin".equals(user)) { // correct comparison
             log.info("Admin path at {}", TS_FMT.format(ZonedDateTime.now()));
         }
 
-        // Example: read secrets from env (do not log them)
         String apiKey = System.getenv("THIRDPARTY_API_KEY");
         if (apiKey == null || apiKey.isBlank()) {
             log.warn("Third-party API key not configured");
         }
 
-        // Tiny in-memory H2 provider so the example runs as-is
-        ConnectionProvider cp = new H2MemoryConnectionProvider();
+        // Closeable provider (lifecycle managed)
+        try (ConnectionProvider cp = new H2MemoryConnectionProvider()) {
+            List<String> users = findUsers(cp, user);
 
-        List<String> users = findUsers(cp, user);
+            String summary = users.stream()
+                    .map(String::toUpperCase)
+                    .distinct()
+                    .sorted()
+                    .reduce((a, b) -> a + ", " + b)
+                    .orElse("<none>");
+            log.info("Users: {}", summary);
+        } catch (SQLException e) {
+            log.error("Fatal DB setup/close error", e);
+        }
 
-        // Light stream use (distinct/sorted/join) — not overused
-        String summary = users.stream()
-                .map(String::toUpperCase)
-                .distinct()
-                .sorted()
-                .reduce((a, b) -> a + ", " + b)
-                .orElse("<none>");
-        log.info("Users: {}", summary);
-
-        long elapsedMs = (System.nanoTime() - startNs) / 1_000_000L; // primitive math
+        long elapsedMs = (System.nanoTime() - startNs) / 1_000_000L;
         log.info("Completed in {} ms", elapsedMs);
     }
 
-    /** Abstraction to keep DB handling testable and DI-friendly. */
-    public interface ConnectionProvider {
+    /** DI-friendly and closeable connection provider. */
+    public interface ConnectionProvider extends AutoCloseable {
         Connection getConnection() throws SQLException;
+        @Override
+        void close() throws SQLException; // explicit lifecycle hook
     }
 
-    /** Minimal, safe H2 setup for demo/testing (no secrets, no logs of PII). */
+    /** Safe in-memory H2 with proper shutdown on close (no secrets). */
     static final class H2MemoryConnectionProvider implements ConnectionProvider {
         private static final String URL = "jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1";
 
@@ -111,5 +112,19 @@ public final class BadExample {
         public Connection getConnection() throws SQLException {
             return DriverManager.getConnection(URL);
         }
+
+        @Override
+        public void close() throws SQLException {
+            // Cleanly shut down the in-memory database
+            try (Connection c = DriverManager.getConnection(URL);
+                 Statement st = c.createStatement()) {
+                st.execute("SHUTDOWN");
+            }
+        }
+    }
+
+    /** Optional custom unchecked exception if you prefer bubbling up errors. */
+    public static final class DataAccessException extends RuntimeException {
+        public DataAccessException(String message, Throwable cause) { super(message, cause); }
     }
 }
