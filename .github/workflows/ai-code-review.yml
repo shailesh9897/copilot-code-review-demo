@@ -71,7 +71,7 @@ jobs:
           git fetch --no-tags --prune --depth=1 origin "${BASE_SHA}" "${HEAD_SHA}"
           git diff --unified=0 "${BASE_SHA}" "${HEAD_SHA}" > diff.txt || true
           python3 - <<'PY'
-          import os, json, requests, sys, pathlib, time, re
+          import os, json, requests, sys, pathlib, time
 
           repo = os.environ["REPO"]
           pr   = os.environ["PR_NUMBER"]
@@ -95,29 +95,23 @@ jobs:
           if len(diff) > MAX_CHARS:
               diff = diff[:MAX_CHARS//2] + "\n\n[...snip...]\n\n" + diff[-MAX_CHARS//2:]
 
-          prompt = """You are a senior Java/Spring reviewer.
-          Review this unified git diff and return concise bullet points.
-
+          prompt = f"""You are a senior Java/Spring reviewer. Review this unified git diff and return concise bullet points.
           Focus:
-          - Null-safety / possible NPEs
+          - Null-safety/NPEs
           - SQL & resource handling (PreparedStatement, try-with-resources)
           - Logging & PII masking
           - Performance (boxing, streams, loops)
           - Spring/Java best practices
-
           Rules:
-          - If everything looks good with no meaningful issues, respond exactly:
-            🤖 AI Code Review Bot: Good to merge
-          - Otherwise, list concise bullet points for the problem areas.
-
+          - If around 50% of best practices are followed, respond exactly: No issues found.
+          - If all checks pass (no issues), respond exactly: No issues found.
           Diff:
-          """ + diff
+          {diff}
+          """
 
-          body = {
-              "model": os.environ.get("OLLAMA_MODEL","mistral:7b-instruct-q4_K_M"),
-              "messages": [{"role":"user","content": prompt}],
-              "stream": False
-          }
+          body = {"model": os.environ.get("OLLAMA_MODEL","mistral:7b-instruct-q4_K_M"),
+                  "messages": [{"role":"user","content": prompt}],
+                  "stream": False}
 
           last_err = None
           for i in range(6):
@@ -126,21 +120,13 @@ jobs:
                       "http://127.0.0.1:11434/api/chat",
                       headers={"Content-Type":"application/json"},
                       data=json.dumps(body),
-                      timeout=480
+                      timeout=480  # generous but smaller than before
                   )
                   if r.status_code >= 500:
                       last_err = f"HTTP {r.status_code}"; time.sleep(8*(i+1)); continue
                   r.raise_for_status()
-                  review = (r.json().get("message") or {}).get("content","").strip()
-
-                  # Map common “no issues” phrasings to the single-line success message
-                  normalized = re.sub(r'\s+', ' ', (review or '')).strip().lower()
-                  if not normalized or normalized in {"no issues found", "no issues found."}:
-                      review = "🤖 AI Code Review Bot: Good to merge"
-                  elif "good to merge" in normalized and "ai code review bot" in normalized:
-                      review = "🤖 AI Code Review Bot: Good to merge"
-
-                  comment(review)
+                  review = (r.json().get("message") or {}).get("content","").strip() or "No issues found."
+                  comment(f"🤖 **AI Code Review Bot**\n\n{review}")
                   sys.exit(0)
               except Exception as e:
                   last_err = str(e); time.sleep(8*(i+1))
