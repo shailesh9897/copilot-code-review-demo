@@ -1,4 +1,4 @@
-package com.example.review;
+package com.code.assistance.codeassistance.service;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
