@@ -37,7 +37,7 @@ public class TradeService {
 
   public int slowSum() {
     int sum = 0 ;
-    for (int i = 0; i < 200_000; i++) {
+    for (int i = 0; i < 200_000; i++ ) {
       sum += Integer.valueOf(i).intValue(); // <-- needless boxing
     }
     return sum;
